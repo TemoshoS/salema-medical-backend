@@ -10,6 +10,7 @@ import callbackRequestRoutes from "./routes/callbackRequestRoutes.js";
 import authRoutes from "./routes/authRoutes.js";
 import placesRoutes from "./routes/placesRoutes.js";
 import callSessionRoutes from "./routes/callSessionRoutes.js";
+import providerRoutes from "./routes/providerRoutes.js";
 import { initializeMedicalTrackingSocket } from "./services/medicalTrackingSocket.js";
 
 const app = express();
@@ -30,13 +31,24 @@ const httpServer = createServer(app);
 const allowedOrigin =
   process.env.CLIENT_ORIGIN || "http://localhost:8081";
 
+const allowedOrigins = [
+  allowedOrigin,
+  "http://localhost:5173",
+];
+
 initializeMedicalTrackingSocket(httpServer, allowedOrigin);
 
 app.use(helmet());
 
 app.use(
   cors({
-    origin: allowedOrigin,
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`CORS blocked origin: ${origin}`));
+      }
+    },
   })
 );
 
@@ -47,6 +59,7 @@ app.use("/api/callback-requests", callbackRequestRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/places", placesRoutes);
 app.use("/api/call-sessions", callSessionRoutes);
+app.use("/api/providers", providerRoutes);
 
 app.get("/api/health", (_req, res) => {
   res.status(200).json({

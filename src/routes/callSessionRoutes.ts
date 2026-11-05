@@ -215,10 +215,15 @@ router.post("/", async (req: Request, res: Response) => {
     }
 
     const ringingCutoff = new Date(Date.now() - 60_000);
+    // Prevent abandoned accepted sessions from blocking calls indefinitely.
+    const acceptedCutoff = new Date(Date.now() - 4 * 60 * 60 * 1000);
 
     const activeQuery: Record<string, unknown> = {
       $or: [
-        { status: "ACCEPTED" },
+        {
+          status: "ACCEPTED",
+          acceptedAt: { $gte: acceptedCutoff },
+        },
         {
           status: "RINGING",
           createdAt: { $gte: ringingCutoff },
@@ -271,7 +276,9 @@ router.post("/", async (req: Request, res: Response) => {
       roomName,
     });
 
+    const caller = await User.findById(callerId).select("fullName");
     const callPayload = {
+      callerName: caller?.fullName || "Patient",
       callSessionId: session.callSessionId,
       ...(session.requestId ? { requestId: session.requestId } : {}),
       callerUserId: session.callerUserId,

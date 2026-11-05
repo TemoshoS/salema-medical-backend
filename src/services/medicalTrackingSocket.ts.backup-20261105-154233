@@ -13,9 +13,14 @@ interface AuthenticatedSocket extends Socket {
 }
 
 let trackingIO: Server | null = null;
+const CONTROL_ROOM_ROOM = "control-room:requests";
 
 function getRequestRoom(requestId: string): string {
   return `medical-request:${requestId}`;
+}
+
+function getUserRoom(userId: string): string {
+  return `user:${userId}`;
 }
 
 export function initializeMedicalTrackingSocket(
@@ -78,11 +83,22 @@ export function initializeMedicalTrackingSocket(
   });
 
   io.on("connection", (socket) => {
+    const connectedUserId = (socket as AuthenticatedSocket).data.userId;
+
+    // Private room used for recipient-specific call notifications.
+    if (connectedUserId) {
+      void socket.join(getUserRoom(connectedUserId));
+    }
     const authenticatedSocket = socket as AuthenticatedSocket;
 
     console.log(
       `Authenticated tracking client connected: ${socket.id} (${authenticatedSocket.data.role})`
     );
+
+    // Only authenticated, approved CONTROL_ROOM accounts join this room.
+    if (authenticatedSocket.data.role === "CONTROL_ROOM") {
+      void socket.join(CONTROL_ROOM_ROOM);
+    }
 
     socket.on(
       "medical-request:join",
@@ -157,6 +173,59 @@ export function initializeMedicalTrackingSocket(
   return io;
 }
 
+/**
+ * Return unique Control Room user IDs with an authenticated,
+ * approved account connected to the socket server.
+ */
+export async function getOnlineControlRoomUserIds(): Promise<string[]> {
+  if (!trackingIO) return [];
+
+  const sockets = await trackingIO
+    .in(CONTROL_ROOM_ROOM)
+    .fetchSockets();
+
+  return [
+    ...new Set(
+      sockets
+        .map((socket) => {
+          const data = socket.data as {
+            userId?: string;
+            role?: string;
+          };
+
+          return data.role === "CONTROL_ROOM" ? data.userId : undefined;
+        })
+        .filter((userId): userId is string => Boolean(userId))
+    ),
+  ];
+}
+
+/**
+ * Broadcast a direct patient call to all connected Control Room staff.
+ */
+export function broadcastCallToControlRoom(
+  event: "call-session:incoming" | "call-session:resolved",
+  payload: Record<string, unknown>
+): void {
+  if (!trackingIO) {
+    console.error("Tracking socket server has not been initialized.");
+    return;
+  }
+
+  trackingIO.to(CONTROL_ROOM_ROOM).emit(event, payload);
+}
+
+export function broadcastProviderPresence(payload: {
+  providerId: string;
+  latitude: number;
+  longitude: number;
+  updatedAt: Date;
+}): void {
+  if (!trackingIO) return;
+
+  trackingIO.to(CONTROL_ROOM_ROOM).emit("provider:presence-updated", payload);
+}
+
 export function broadcastProviderLocation(
   requestId: string,
   status: string,
@@ -171,7 +240,7 @@ export function broadcastProviderLocation(
     return;
   }
 
-  trackingIO.to(getRequestRoom(requestId)).emit(
+  trackingIO.to(getRequestRoom(requestId)).to(CONTROL_ROOM_ROOM).emit(
     "medical-request:location-updated",
     {
       requestId,
@@ -196,7 +265,7 @@ export function broadcastMedicalRequestStatus(
     return;
   }
 
-  trackingIO.to(getRequestRoom(requestId)).emit(
+  trackingIO.to(getRequestRoom(requestId)).to(CONTROL_ROOM_ROOM).emit(
     "medical-request:status-updated",
     {
       requestId,
@@ -205,4 +274,60 @@ export function broadcastMedicalRequestStatus(
       dispatchConfirmedAt: dispatchConfirmedAt ?? null,
     }
   );
+}
+
+
+/**
+ * Notify connected control-room dashboards that a request was created.
+ * The dashboard fetches the full request through the existing authenticated API.
+ */
+export function broadcastNewMedicalRequest(
+  requestId: string,
+  status: string,
+  serviceType: string,
+  createdAt: Date
+): void {
+  if (!trackingIO) {
+    console.error("Tracking socket server has not been initialized.");
+    return;
+  }
+
+  trackingIO.to(CONTROL_ROOM_ROOM).emit("medical-request:created", {
+    requestId,
+    status,
+    serviceType,
+    createdAt,
+  });
+}
+
+
+/**
+ * Send a call-session event only to the intended authenticated user.
+ */
+export function broadcastIncomingCall(
+  recipientUserId: string,
+  event:
+    | "call-session:incoming"
+    | "call-session:updated",
+  payload: {
+    callSessionId: string;
+    requestId?: string;
+    callerUserId: string;
+    callerRole: string;
+    recipientUserId: string;
+    recipientRole: string;
+    callType: string;
+    status: string;
+    createdAt?: Date;
+    acceptedAt?: Date;
+    endedAt?: Date;
+    outcome?: string;
+  }
+): void {
+  if (!trackingIO) {
+    console.error("Tracking socket server has not been initialized.");
+    return;
+  }
+
+  trackingIO.to(getUserRoom(recipientUserId)).emit(event, payload);
 }

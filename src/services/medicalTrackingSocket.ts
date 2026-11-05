@@ -215,6 +215,17 @@ export function broadcastCallToControlRoom(
   trackingIO.to(CONTROL_ROOM_ROOM).emit(event, payload);
 }
 
+export function broadcastProviderPresence(payload: {
+  providerId: string;
+  latitude: number;
+  longitude: number;
+  updatedAt: Date;
+}): void {
+  if (!trackingIO) return;
+
+  trackingIO.to(CONTROL_ROOM_ROOM).emit("provider:presence-updated", payload);
+}
+
 export function broadcastProviderLocation(
   requestId: string,
   status: string,
@@ -319,4 +330,21 @@ export function broadcastIncomingCall(
   }
 
   trackingIO.to(getUserRoom(recipientUserId)).emit(event, payload);
+}
+
+
+/**
+ * Notify authenticated Control Room dashboards of a submitted provider application.
+ * The payload contains notification text only, never applicant identity documents or
+ * other restricted application fields.
+ */
+export function broadcastProviderApplicationNotification(
+  payload: Record<string, unknown>
+): void {
+  if (!trackingIO) {
+    console.error("Tracking socket server has not been initialized.");
+    return;
+  }
+
+  trackingIO.to(CONTROL_ROOM_ROOM).emit("provider-application:submitted", payload);
 }

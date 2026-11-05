@@ -1,0 +1,90 @@
+import { Router } from "express";
+import {
+  submitProviderApplication,
+} from "../controllers/providerApplicationController.js";
+import {
+  approveProviderApplication,
+  getProviderApplication,
+  downloadProviderApplicationDocument,
+  listProviderApplications,
+  markProviderApplicationUnderReview,
+  rejectProviderApplication,
+} from "../controllers/providerReviewController.js";
+import { registrationLimiter } from "../middleware/rateLimiters.js";
+import { authenticateToken } from "../middleware/authMiddleware.js";
+import {
+  clearNotifications,
+  listNotifications,
+  markAllNotificationsRead,
+  markNotificationRead,
+} from "../controllers/notificationController.js";
+import multer from "multer";
+import {
+  uploadProviderDocuments,
+  removeProviderFiles,
+} from "../middleware/providerDocumentUpload.js";
+
+const router = Router();
+
+// Public registration endpoint. Providers must still verify their email
+// and receive Control Room approval before they can access protected APIs.
+router.post(
+  "/applications",
+  registrationLimiter,
+  (req, res, next) => {
+    uploadProviderDocuments(req, res, (error) => {
+      if (!error) {
+        next();
+        return;
+      }
+
+      const files = (req.files as Express.Multer.File[] | undefined) ?? [];
+
+      void removeProviderFiles(files).finally(() => {
+        const message =
+          error instanceof multer.MulterError
+            ? error.code === "LIMIT_FILE_SIZE"
+              ? "Each document must be 10 MB or smaller."
+              : "The uploaded documents exceed the allowed upload limits."
+            : error.message || "Unable to accept the uploaded documents.";
+
+        res.status(400).json({
+          success: false,
+          message,
+        });
+      });
+    });
+  },
+  submitProviderApplication
+);
+
+// All review endpoints require an authenticated, approved account.
+// The controller additionally restricts these actions to CONTROL_ROOM.
+router.use(authenticateToken);
+
+// Control Room notification centre.
+router.get("/notifications", listNotifications);
+router.patch("/notifications/read-all", markAllNotificationsRead);
+router.delete("/notifications/clear", clearNotifications);
+router.patch("/notifications/:notificationId/read", markNotificationRead);
+
+router.get("/applications", listProviderApplications);
+router.get(
+  "/applications/:applicationId/documents/:documentId",
+  downloadProviderApplicationDocument
+);
+router.get("/applications/:applicationId", getProviderApplication);
+router.patch(
+  "/applications/:applicationId/review",
+  markProviderApplicationUnderReview
+);
+router.patch(
+  "/applications/:applicationId/approve",
+  approveProviderApplication
+);
+router.patch(
+  "/applications/:applicationId/reject",
+  rejectProviderApplication
+);
+
+export default router;

@@ -4,7 +4,10 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { randomInt, randomBytes, createHash } from "node:crypto";
 import User from "../models/User.js";
-import { sendEmailVerificationCode } from "../services/emailService.js";
+import {
+  sendEmailVerificationCode,
+  sendPasswordResetCode,
+} from "../services/emailService.js";
 
 function getJwtSecret(): string {
   const secret = process.env.JWT_SECRET;
@@ -47,10 +50,10 @@ export async function register(
       return;
     }
 
-    if (password.length < 12 || password.length > 128) {
+    if (password.length < 6 || password.length > 128 || !/[0-9]/.test(password) || !/[^A-Za-z0-9\s]/.test(password)) {
       res.status(400).json({
         success: false,
-        message: "Password must be between 12 and 128 characters.",
+        message: "Password must be 6–128 characters and include at least one number and one special character.",
       });
       return;
     }
@@ -166,7 +169,13 @@ export async function verifyEmail(
     }
 
     user.emailVerified = true;
-    user.accountStatus = "APPROVED";
+
+    // Patients may proceed after email verification.
+    // Providers must remain pending until Control Room approval.
+    if (user.role === "PATIENT") {
+      user.accountStatus = "APPROVED";
+    }
+
     user.verificationCodeHash = undefined;
     user.verificationCodeExpiresAt = undefined;
 
@@ -174,7 +183,11 @@ export async function verifyEmail(
 
     res.status(200).json({
       success: true,
-      message: "Email verified successfully. You can now log in.",
+      message:
+        user.role === "PROVIDER"
+          ? "Email verified. Your provider application is awaiting Control Room review."
+          : "Email verified successfully. You can now log in.",
+      accountStatus: user.accountStatus,
     });
   } catch (error) {
     console.error("Email verification failed:", error);
@@ -267,23 +280,134 @@ export async function login(
     });
 
 
-    res.status(200).json({
-      success: true,
-      message: "Login successful.",
-      token,
-      expiresIn: 28800,
-      user: {
-        id: user.id,
-        fullName: user.fullName,
-        email: user.email,
-        role: user.role,
-      },
-    });
   } catch (error) {
     console.error("Login failed:", error);
     res.status(500).json({
       success: false,
       message: "Unable to log in.",
+    });
+  }
+}
+
+export async function requestPasswordReset(
+  req: Request,
+  res: Response
+): Promise<void> {
+  try {
+    const { email } = req.body;
+
+    if (typeof email !== "string" || !email.trim()) {
+      res.status(400).json({
+        success: false,
+        message: "A valid email address is required.",
+      });
+      return;
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+    const user = await User.findOne({ email: normalizedEmail }).select(
+      "+passwordResetCodeHash +passwordResetCodeExpiresAt"
+    );
+
+    if (user) {
+      const code = randomInt(100000, 1000000).toString();
+      user.passwordResetCodeHash = hashVerificationCode(code);
+      user.passwordResetCodeExpiresAt = new Date(Date.now() + 15 * 60 * 1000);
+      await user.save();
+
+      try {
+        await sendPasswordResetCode(user.email, code);
+      } catch (emailError) {
+        console.error("Password reset email delivery failed:", emailError);
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "If an account exists for that email, a password reset code has been sent.",
+    });
+  } catch (error) {
+    console.error("Password reset request failed:", error);
+    res.status(500).json({
+      success: false,
+      message: "Unable to process the password reset request.",
+    });
+  }
+}
+
+export async function resetPassword(
+  req: Request,
+  res: Response
+): Promise<void> {
+  try {
+    const { email, code, password } = req.body;
+
+    if (
+      typeof email !== "string" ||
+      !email.trim() ||
+      typeof code !== "string" ||
+      !/^\d{6}$/.test(code) ||
+      typeof password !== "string"
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "Email, six-digit reset code and new password are required.",
+      });
+      return;
+    }
+
+    if (
+      password.length < 6 ||
+      password.length > 128 ||
+      !/[0-9]/.test(password) ||
+      !/[^A-Za-z0-9\s]/.test(password)
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "Password must be 6–128 characters and include at least one number and one special character.",
+      });
+      return;
+    }
+
+    const user = await User.findOne({
+      email: email.trim().toLowerCase(),
+    }).select(
+      "+passwordHash +passwordResetCodeHash +passwordResetCodeExpiresAt +refreshTokenHash +refreshTokenExpiresAt"
+    );
+
+    if (
+      !user ||
+      !user.passwordResetCodeHash ||
+      !user.passwordResetCodeExpiresAt ||
+      user.passwordResetCodeExpiresAt.getTime() <= Date.now() ||
+      hashVerificationCode(code) !== user.passwordResetCodeHash
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid or expired password reset code.",
+      });
+      return;
+    }
+
+    user.passwordHash = await bcrypt.hash(password, 12);
+    user.passwordResetCodeHash = undefined;
+    user.passwordResetCodeExpiresAt = undefined;
+
+    // Revoke the existing refresh session after a password change.
+    user.refreshTokenHash = undefined;
+    user.refreshTokenExpiresAt = undefined;
+
+    await user.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Password reset successfully. Please log in with your new password.",
+    });
+  } catch (error) {
+    console.error("Password reset failed:", error);
+    res.status(500).json({
+      success: false,
+      message: "Unable to reset your password.",
     });
   }
 }

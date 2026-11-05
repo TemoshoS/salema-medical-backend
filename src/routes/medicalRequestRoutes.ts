@@ -4,12 +4,15 @@ import MedicalRequest, {
   type MedicalRequestStatus,
 } from "../models/MedicalRequest.js";
 import User from "../models/User.js";
+import ProviderApplication from "../models/ProviderApplication.js";
+import ProviderPresence from "../models/ProviderPresence.js";
 import { authenticateToken } from "../middleware/authMiddleware.js";
 import { medicalRequestLimiter } from "../middleware/rateLimiters.js";
 import {
   broadcastProviderLocation,
   broadcastMedicalRequestStatus,
   broadcastNewMedicalRequest,
+  broadcastProviderPresence,
 } from "../services/medicalTrackingSocket.js";
 
 const router = Router();
@@ -29,7 +32,23 @@ router.get("/providers/approved", async (req: Request, res: Response) => {
       });
     }
 
+    const approvedApplications = await ProviderApplication.find({
+      status: "APPROVED",
+    })
+      .select("userId providerType organisationName serviceArea")
+      .lean();
+
+    const applicationByUserId = new Map(
+      approvedApplications.map((application) => [
+        application.userId.toString(),
+        application,
+      ])
+    );
+
     const providers = await User.find({
+      _id: {
+        $in: approvedApplications.map((application) => application.userId),
+      },
       role: "PROVIDER",
       accountStatus: "APPROVED",
       emailVerified: true,
@@ -38,15 +57,25 @@ router.get("/providers/approved", async (req: Request, res: Response) => {
       .sort({ fullName: 1 })
       .lean();
 
-    return res.json({
-      success: true,
-      count: providers.length,
-      providers: providers.map((provider) => ({
+    const eligibleProviders = providers.flatMap((provider) => {
+      const application = applicationByUserId.get(provider._id.toString());
+      if (!application) return [];
+
+      return [{
         id: provider._id.toString(),
         fullName: provider.fullName,
         email: provider.email,
         phoneNumber: provider.phoneNumber,
-      })),
+        providerType: application.providerType,
+        organisationName: application.organisationName,
+        serviceArea: application.serviceArea,
+      }];
+    });
+
+    return res.json({
+      success: true,
+      count: eligibleProviders.length,
+      providers: eligibleProviders,
     });
   } catch (error) {
     console.error("List approved providers failed:", error);
@@ -59,6 +88,196 @@ router.get("/providers/approved", async (req: Request, res: Response) => {
 });
 
 
+
+/**
+ * Provider heartbeat: only approved providers may publish their own GPS.
+ * The Control Room receives this feed; patients do not.
+ */
+router.patch("/providers/presence", async (req: Request, res: Response) => {
+  try {
+    if (!req.user || req.user.role !== "PROVIDER") {
+      return res.status(403).json({
+        success: false,
+        message: "Only provider accounts can publish provider presence.",
+      });
+    }
+
+    const providerId = req.user.userId;
+    const [user, application] = await Promise.all([
+      User.findOne({
+        _id: providerId,
+        role: "PROVIDER",
+        accountStatus: "APPROVED",
+        emailVerified: true,
+      }).select("_id"),
+      ProviderApplication.findOne({
+        userId: providerId,
+        status: "APPROVED",
+      }).select("_id"),
+    ]);
+
+    if (!user || !application) {
+      return res.status(403).json({
+        success: false,
+        message: "An approved provider application is required.",
+      });
+    }
+
+    const latitude = req.body?.latitude;
+    const longitude = req.body?.longitude;
+
+    if (
+      typeof latitude !== "number" ||
+      typeof longitude !== "number" ||
+      !Number.isFinite(latitude) ||
+      !Number.isFinite(longitude) ||
+      latitude < -90 || latitude > 90 ||
+      longitude < -180 || longitude > 180
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid latitude and longitude are required.",
+      });
+    }
+
+    const presence = await ProviderPresence.findOneAndUpdate(
+      { userId: providerId },
+      { $set: { latitude, longitude, updatedAt: new Date() } },
+      { upsert: true, new: true, runValidators: true, setDefaultsOnInsert: true }
+    );
+
+    const payload = {
+      providerId,
+      latitude: presence.latitude,
+      longitude: presence.longitude,
+      updatedAt: presence.updatedAt,
+    };
+
+    broadcastProviderPresence(payload);
+
+    return res.json({ success: true, presence: payload });
+  } catch (error) {
+    console.error("Update provider presence failed:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to update provider presence.",
+    });
+  }
+});
+
+/**
+ * Fleet feed for authenticated Control Room users.
+ * A location is online only when its last update is recent.
+ */
+router.get("/providers/presence", async (req: Request, res: Response) => {
+  try {
+    if (!req.user || req.user.role !== "CONTROL_ROOM") {
+      return res.status(403).json({
+        success: false,
+        message: "Only authorised Control Room users can view fleet locations.",
+      });
+    }
+
+    const applications = await ProviderApplication.find({ status: "APPROVED" })
+      .select("userId providerType organisationName serviceArea vehicleType vehicleRegistrationNumber")
+      .lean();
+
+    const applicationByUserId = new Map(
+      applications.map((application) => [application.userId.toString(), application])
+    );
+
+    const users = await User.find({
+      _id: { $in: applications.map((application) => application.userId) },
+      role: "PROVIDER",
+      accountStatus: "APPROVED",
+      emailVerified: true,
+    }).select("_id fullName").lean();
+
+    const userIds = users.map((user) => user._id.toString());
+    const presences = await ProviderPresence.find({
+      userId: { $in: userIds },
+    }).lean();
+
+    const presenceByUserId = new Map(
+      presences.map((presence) => [presence.userId, presence])
+    );
+
+    const activeStatuses = [
+      "PROVIDER_ACCEPTED",
+      "DISPATCHED",
+      "ON_THE_WAY",
+      "ARRIVED_AT_PICKUP",
+      "PATIENT_TRANSPORTING",
+    ];
+
+    const activeRequestFilter: Record<string, unknown> = {
+      assignedProviderId: { $in: userIds },
+      status: { $in: activeStatuses },
+    };
+
+    const activeRequests = await MedicalRequest.find(
+      activeRequestFilter as any
+    )
+      .select("assignedProviderId requestId status")
+      .lean()
+      .exec() as Array<{
+        assignedProviderId?: string;
+        requestId: string;
+        status: string;
+      }>;
+
+    const activeRequestByProvider = new Map<string, { requestId?: string; status?: string }>();
+    for (const request of activeRequests) {
+      if (request.assignedProviderId) {
+        activeRequestByProvider.set(String(request.assignedProviderId), {
+          requestId: request.requestId,
+          status: request.status,
+        });
+      }
+    }
+
+    const onlineCutoff = Date.now() - 90_000;
+
+    const fleet = users.map((user) => {
+      const id = user._id.toString();
+      const application = applicationByUserId.get(id);
+      const presence = presenceByUserId.get(id);
+      const updatedAt = presence?.updatedAt ?? null;
+      const online = Boolean(
+        presence &&
+        updatedAt &&
+        new Date(updatedAt).getTime() >= onlineCutoff
+      );
+      const assignment = activeRequestByProvider.get(id);
+
+      return {
+        providerId: id,
+        fullName: user.fullName,
+        providerType: application?.providerType,
+        organisationName: application?.organisationName,
+        serviceArea: application?.serviceArea,
+        vehicleType: application?.vehicleType,
+        vehicleRegistrationNumber: application?.vehicleRegistrationNumber,
+        latitude: presence?.latitude ?? null,
+        longitude: presence?.longitude ?? null,
+        updatedAt,
+        online,
+        assigned: Boolean(assignment),
+        available: online && !assignment,
+        activeRequestId: assignment?.requestId ?? null,
+        activeRequestStatus: assignment?.status ?? null,
+      };
+    });
+
+    return res.json({ success: true, count: fleet.length, providers: fleet });
+  } catch (error) {
+    console.error("List provider presence failed:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to retrieve provider presence.",
+    });
+  }
+});
 
 /**
  * List medical requests belonging to the authenticated patient.
@@ -250,6 +469,43 @@ router.post("/", medicalRequestLimiter, async (req: Request, res: Response) => {
         message:
           "Medical transport requires a selected destination and requested date/time.",
       });
+    }
+
+    // Validate transport-only fields on the server as well as in the app.
+    if (serviceType === "MEDICAL_TRANSPORT") {
+      const appointmentDate = new Date(requestedDateTime);
+
+      if (
+        typeof requestedDateTime !== "string" ||
+        !requestedDateTime.trim() ||
+        !Number.isFinite(appointmentDate.getTime()) ||
+        appointmentDate.getTime() <= Date.now()
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Medical transport date and time must be valid and in the future.",
+        });
+      }
+
+      if (
+        typeof wheelchairRequired !== "boolean" ||
+        typeof companionTravelling !== "boolean"
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Wheelchair and companion selections must be true or false.",
+        });
+      }
+
+      if (
+        transportNotes !== undefined &&
+        (typeof transportNotes !== "string" || transportNotes.length > 1000)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Transport notes must be text no longer than 1000 characters.",
+        });
+      }
     }
 
     // Validate pickup coordinates if supplied.
@@ -458,6 +714,56 @@ router.patch("/:requestId/status", async (req: Request, res: Response) => {
         return res.status(400).json({
           success: false,
           message: "The provider must have a verified and approved account.",
+        });
+      }
+
+      const providerApplication = await ProviderApplication.findOne({
+        userId: provider._id,
+        status: "APPROVED",
+      }).select("providerType");
+
+      if (!providerApplication) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "The provider must have an approved provider application before assignment.",
+        });
+      }
+
+      const providerType = providerApplication.providerType;
+
+      if (
+        request.serviceType === "EMERGENCY_AMBULANCE" &&
+        providerType !== "AMBULANCE_COMPANY"
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Emergency ambulance requests can only be assigned to an approved ambulance company.",
+        });
+      }
+
+      if (
+        request.serviceType === "MEDICAL_TRANSPORT" &&
+        providerType !== "MEDICAL_TRANSPORT_COMPANY" &&
+        providerType !== "INDIVIDUAL_DRIVER"
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Medical transport requests can only be assigned to an approved medical transport company or eligible individual driver.",
+        });
+      }
+
+      if (
+        request.serviceType === "MEDICAL_TRANSPORT" &&
+        providerType === "INDIVIDUAL_DRIVER" &&
+        request.urgencyLevel !== "NON_EMERGENCY"
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Individual drivers can only be assigned to non-emergency transport requests.",
         });
       }
 
