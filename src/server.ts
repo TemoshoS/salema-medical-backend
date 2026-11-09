@@ -28,27 +28,25 @@ app.use((req, res, next) => {
 });
 
 const httpServer = createServer(app);
-const allowedOrigin =
-  process.env.CLIENT_ORIGIN || "http://localhost:8081";
-
 const allowedOrigins = [
-  allowedOrigin,
   "http://localhost:5173",
+  "http://localhost:8081",
+  "https://controlroom.mygsalema.co.za",
 ];
 
-initializeMedicalTrackingSocket(httpServer, allowedOrigin);
+initializeMedicalTrackingSocket(
+  httpServer,
+  process.env.CLIENT_ORIGIN || "http://localhost:8081"
+);
 
 app.use(helmet());
 
 app.use(
   cors({
-    origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error(`CORS blocked origin: ${origin}`));
-      }
-    },
+    origin: allowedOrigins,
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
