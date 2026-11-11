@@ -27,9 +27,10 @@ function hashRefreshToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
-export async function register(
+async function registerWithRole(
   req: Request,
-  res: Response
+  res: Response,
+  role: "PATIENT" | "CONTROL_ROOM"
 ): Promise<void> {
   try {
     const { fullName, email, phoneNumber, password } = req.body;
@@ -80,7 +81,7 @@ export async function register(
       email: normalizedEmail,
       phoneNumber: phoneNumber.trim(),
       passwordHash,
-      role: "PATIENT",
+      role,
       accountStatus: "PENDING",
       emailVerified: false,
       verificationCodeHash,
@@ -114,6 +115,20 @@ export async function register(
       message: "Unable to create account.",
     });
   }
+}
+
+export async function register(
+  req: Request,
+  res: Response
+): Promise<void> {
+  await registerWithRole(req, res, "PATIENT");
+}
+
+export async function registerControlRoom(
+  req: Request,
+  res: Response
+): Promise<void> {
+  await registerWithRole(req, res, "CONTROL_ROOM");
 }
 
 export async function verifyEmail(
@@ -170,9 +185,9 @@ export async function verifyEmail(
 
     user.emailVerified = true;
 
-    // Patients may proceed after email verification.
+    // Patients and Control Room accounts are approved after email verification.
     // Providers must remain pending until Control Room approval.
-    if (user.role === "PATIENT") {
+    if (user.role === "PATIENT" || user.role === "CONTROL_ROOM") {
       user.accountStatus = "APPROVED";
     }
 
@@ -186,7 +201,7 @@ export async function verifyEmail(
       message:
         user.role === "PROVIDER"
           ? "Email verified. Your provider application is awaiting Control Room review."
-          : "Email verified successfully. You can now log in.",
+          : "Email verified successfully. Your account is approved. You can now log in.",
       accountStatus: user.accountStatus,
     });
   } catch (error) {

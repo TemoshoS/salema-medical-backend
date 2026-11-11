@@ -1,6 +1,7 @@
 import { Router } from "express";
 import {
   register,
+  registerControlRoom,
   login,
   verifyEmail,
   refreshAccessToken,
@@ -18,6 +19,7 @@ import {
 const router = Router();
 
 router.post("/register", registrationLimiter, register);
+router.post("/register-control-room", registrationLimiter, registerControlRoom);
 router.post("/verify-email", emailVerificationLimiter, verifyEmail);
 router.post("/login", loginLimiter, login);
 router.post("/refresh", refreshAccessToken);
